@@ -1,0 +1,43 @@
+# CI test values for Helm chart validation
+# Usage: helm template app ./helm-charts/app -f helm-charts/app/ci/test-values.yaml
+replicaCount: 1
+
+image:
+  repository: nginx
+  tag: "1.25"
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+autoscaling:
+  enabled: false
+
+ingress:
+  enabled: false
+
+networkPolicy:
+  enabled: true
+
+podDisruptionBudget:
+  enabled: false
+
+serviceAccount:
+  create: true
+  annotations: {}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
