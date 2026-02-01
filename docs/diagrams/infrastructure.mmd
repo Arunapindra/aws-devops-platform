@@ -1,0 +1,52 @@
+graph TD
+    subgraph "AWS Account"
+        subgraph "VPC (10.0.0.0/16)"
+            subgraph "Public Subnets"
+                ALB[Application Load Balancer]
+                NAT[NAT Gateway]
+            end
+            subgraph "Private Subnets (3 AZs)"
+                subgraph "EKS Cluster"
+                    SYS[System Node Group<br/>CoreDNS, kube-proxy]
+                    APP[Application Node Group<br/>Autoscaling 2-10]
+                    subgraph "Namespaces"
+                        NS_APP[devops-platform<br/>Application Pods]
+                        NS_ARGOCD[argocd<br/>ArgoCD Server]
+                        NS_INGRESS[ingress-nginx<br/>Ingress Controller]
+                    end
+                end
+            end
+        end
+
+        ECR[ECR Registry<br/>KMS Encrypted]
+        S3[S3 Bucket<br/>Terraform State]
+        CW[CloudWatch<br/>EKS Logs]
+        IAM[IAM Roles<br/>IRSA / OIDC]
+    end
+
+    subgraph "GitHub"
+        GH_REPO[Repository]
+        GH_ACTIONS[GitHub Actions<br/>CI/CD Pipelines]
+        OIDC_TRUST[OIDC Trust]
+    end
+
+    DEV[Developer] -->|git push| GH_REPO
+    GH_REPO -->|trigger| GH_ACTIONS
+    GH_ACTIONS -->|OIDC auth| OIDC_TRUST
+    OIDC_TRUST -->|assume role| IAM
+    GH_ACTIONS -->|push image| ECR
+    GH_ACTIONS -->|terraform apply| S3
+
+    ECR -->|pull image| APP
+    ALB -->|route traffic| NS_INGRESS
+    NS_INGRESS -->|forward| NS_APP
+    APP -->|logs| CW
+    NAT -->|internet access| APP
+
+    NS_ARGOCD -->|sync| GH_REPO
+    NS_ARGOCD -->|deploy| NS_APP
+
+    style ECR fill:#ff9900,color:#000
+    style ALB fill:#ff9900,color:#000
+    style S3 fill:#3f8624,color:#fff
+    style CW fill:#ff4f8b,color:#fff

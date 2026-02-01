@@ -1,0 +1,34 @@
+graph LR
+    subgraph "CI Pipeline"
+        A[Push / PR] --> B[Lint]
+        B --> C[Security Scan<br/>Trivy + Checkov]
+        C --> D[Build Image]
+        D --> E[Unit Tests]
+    end
+
+    subgraph "CD - Dev"
+        E --> F[Push to ECR]
+        F --> G[Update Kustomize tag]
+        G --> H[ArgoCD Auto-Sync]
+        H --> I[Smoke Tests]
+    end
+
+    subgraph "CD - Staging"
+        I --> J[Manual Approval]
+        J --> K[ArgoCD Manual Sync]
+        K --> L[Integration Tests]
+    end
+
+    subgraph "CD - Prod"
+        L --> M[Canary 10%]
+        M --> N{Metrics OK?}
+        N -->|yes| O[Canary 50%]
+        O --> P{Metrics OK?}
+        P -->|yes| Q[Full Rollout 100%]
+        N -->|no| R[Rollback]
+        P -->|no| R
+    end
+
+    style A fill:#4a90d9,color:#fff
+    style Q fill:#27ae60,color:#fff
+    style R fill:#e74c3c,color:#fff
