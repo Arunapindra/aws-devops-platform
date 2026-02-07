@@ -1,0 +1,347 @@
+###############################################################################
+# CD Pipeline - Deploy to Production
+# Triggers on release tags (v*)
+# Requires manual approval via GitHub Environments
+# Canary deployment: 10% -> 50% -> 100% with rollback on failure
+###############################################################################
+name: CD - Deploy to Production
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write
+  contents: write
+  packages: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: aws-devops-platform/app
+  GITOPS_REPO: aws-devops-platform-gitops
+  APP_NAME: aws-devops-platform
+  PROD_NAMESPACE: production
+
+concurrency:
+  group: cd-prod
+  cancel-in-progress: false
+
+jobs:
+  ###########################################################################
+  # Job 1: Promote staging image to production tag
+  ###########################################################################
+  promote-image:
+    name: Promote Image to Production
+    runs-on: ubuntu-22.04
+    environment:
+      name: production
+      url: https://app.example.com
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.1
+
+      - name: Extract version from tag
+        id: vars
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "image_tag=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Deploying version: ${VERSION}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-cd-prod-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.0.1
+
+      - name: Promote staging image to production tags
+        run: |
+          # Get the manifest of the staging-latest image
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageTag=staging-latest \
+            --query 'images[0].imageManifest' \
+            --output text)
+
+          # Tag as the version tag
+          aws ecr put-image \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-tag ${{ steps.vars.outputs.image_tag }} \
+            --image-manifest "$MANIFEST"
+
+          # Tag as prod-latest
+          aws ecr put-image \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-tag prod-latest \
+            --image-manifest "$MANIFEST"
+
+          echo "Image promoted: staging-latest -> ${{ steps.vars.outputs.image_tag }}, prod-latest"
+
+  ###########################################################################
+  # Job 2: Canary deployment (10% -> 50% -> 100%)
+  ###########################################################################
+  canary-deploy:
+    name: Canary Deployment
+    runs-on: ubuntu-22.04
+    needs: promote-image
+    environment: production
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4.1.1
+        with:
+          repository: ${{ github.repository_owner }}/${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.APP_NAME }}-prod \
+            --region ${{ env.AWS_REGION }}
+
+      # ---- Phase 1: Deploy canary at 10% traffic ----
+      - name: "Canary Phase 1: Deploy at 10% traffic"
+        run: |
+          cd gitops/kubernetes/overlays/prod
+          kustomize edit set image \
+            ${{ env.ECR_REPOSITORY }}=${{ needs.promote-image.outputs.image_tag }}
+          cd ../../..
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(prod): canary 10% - ${{ needs.promote-image.outputs.image_tag }}" || true
+          git push
+
+      - name: Wait for canary pods (10%)
+        run: |
+          sleep 30
+          kubectl rollout status deployment/${{ env.APP_NAME }}-canary \
+            -n ${{ env.PROD_NAMESPACE }} --timeout=300s || true
+
+      - name: Validate canary health (10%)
+        id: canary_10
+        run: |
+          ENDPOINT=$(kubectl get svc ${{ env.APP_NAME }} \
+            -n ${{ env.PROD_NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          ERROR_COUNT=0
+          TOTAL=20
+          for i in $(seq 1 $TOTAL); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${ENDPOINT}/health" || true)
+            if [ "$HTTP_CODE" != "200" ]; then
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+            fi
+            sleep 2
+          done
+          ERROR_RATE=$((ERROR_COUNT * 100 / TOTAL))
+          echo "Error rate at 10% canary: ${ERROR_RATE}%"
+          if [ "$ERROR_RATE" -gt 10 ]; then
+            echo "Canary FAILED at 10% - error rate ${ERROR_RATE}% exceeds threshold"
+            exit 1
+          fi
+          echo "Canary passed at 10%"
+
+      # ---- Phase 2: Scale canary to 50% traffic ----
+      - name: "Canary Phase 2: Scale to 50% traffic"
+        run: |
+          kubectl scale deployment/${{ env.APP_NAME }}-canary \
+            -n ${{ env.PROD_NAMESPACE }} --replicas=3
+          echo "Waiting 30s for traffic shift..."
+          sleep 30
+
+      - name: Validate canary health (50%)
+        id: canary_50
+        run: |
+          ENDPOINT=$(kubectl get svc ${{ env.APP_NAME }} \
+            -n ${{ env.PROD_NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          ERROR_COUNT=0
+          TOTAL=50
+          for i in $(seq 1 $TOTAL); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${ENDPOINT}/health" || true)
+            if [ "$HTTP_CODE" != "200" ]; then
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+            fi
+            sleep 1
+          done
+          ERROR_RATE=$((ERROR_COUNT * 100 / TOTAL))
+          echo "Error rate at 50% canary: ${ERROR_RATE}%"
+          if [ "$ERROR_RATE" -gt 5 ]; then
+            echo "Canary FAILED at 50% - error rate ${ERROR_RATE}% exceeds threshold"
+            exit 1
+          fi
+          echo "Canary passed at 50%"
+
+      # ---- Phase 3: Full rollout at 100% ----
+      - name: "Full Rollout: 100% traffic"
+        run: |
+          kubectl set image deployment/${{ env.APP_NAME }} \
+            app=${{ needs.promote-image.outputs.image_tag }} \
+            -n ${{ env.PROD_NAMESPACE }}
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            -n ${{ env.PROD_NAMESPACE }} --timeout=600s
+          echo "Full rollout complete"
+
+  ###########################################################################
+  # Job 3: Integration tests after full rollout
+  ###########################################################################
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-22.04
+    needs: canary-deploy
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.APP_NAME }}-prod \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Run integration tests
+        run: |
+          ENDPOINT=$(kubectl get svc ${{ env.APP_NAME }} \
+            -n ${{ env.PROD_NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Running integration tests against ${ENDPOINT}..."
+
+          echo "Testing /health endpoint..."
+          curl -sf "http://${ENDPOINT}/health" || exit 1
+
+          echo "Testing /ready endpoint..."
+          curl -sf "http://${ENDPOINT}/ready" || exit 1
+
+          echo "Testing /metrics endpoint..."
+          curl -sf "http://${ENDPOINT}/metrics" || exit 1
+
+          echo "All integration tests passed"
+
+  ###########################################################################
+  # Job 4: Automatic rollback on failure
+  ###########################################################################
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-22.04
+    needs: [canary-deploy, integration-tests]
+    if: failure()
+    environment: production
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.APP_NAME }}-prod \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Rollback deployment
+        run: |
+          echo "ROLLING BACK deployment..."
+          kubectl rollout undo deployment/${{ env.APP_NAME }} \
+            -n ${{ env.PROD_NAMESPACE }}
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            -n ${{ env.PROD_NAMESPACE }} --timeout=300s
+          echo "Rollback completed successfully"
+
+      - name: Scale down canary
+        run: |
+          kubectl scale deployment/${{ env.APP_NAME }}-canary \
+            -n ${{ env.PROD_NAMESPACE }} --replicas=0 || true
+          echo "Canary scaled down"
+
+  ###########################################################################
+  # Job 5: Notifications (Slack + PagerDuty)
+  ###########################################################################
+  notify:
+    name: Notify
+    runs-on: ubuntu-22.04
+    needs: [promote-image, canary-deploy, integration-tests, rollback]
+    if: always()
+    steps:
+      - name: Slack notification on success
+        if: needs.integration-tests.result == 'success'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "Production deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Production Deployment Successful* :white_check_mark:\n*Version:* `${{ needs.promote-image.outputs.image_tag }}`\n*Author:* ${{ github.actor }}\n*Repo:* ${{ github.repository }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Slack notification on failure/rollback
+        if: needs.rollback.result == 'success' || needs.canary-deploy.result == 'failure'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "Production deployment FAILED - Rollback executed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*PRODUCTION DEPLOYMENT FAILED - ROLLBACK EXECUTED* :rotating_light:\n*Version:* `${{ needs.promote-image.outputs.image_tag }}`\n*Author:* ${{ github.actor }}\n*Run:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: PagerDuty alert on failure
+        if: needs.rollback.result == 'success' || needs.canary-deploy.result == 'failure'
+        run: |
+          curl -s -X POST https://events.pagerduty.com/v2/enqueue \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "routing_key": "${{ secrets.PAGERDUTY_ROUTING_KEY }}",
+              "event_action": "trigger",
+              "payload": {
+                "summary": "Production deployment failed and was rolled back - ${{ needs.promote-image.outputs.image_tag }}",
+                "severity": "critical",
+                "source": "github-actions",
+                "component": "${{ env.APP_NAME }}",
+                "custom_details": {
+                  "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                  "version": "${{ needs.promote-image.outputs.image_tag }}",
+                  "actor": "${{ github.actor }}"
+                }
+              }
+            }'

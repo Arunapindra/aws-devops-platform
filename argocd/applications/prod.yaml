@@ -1,0 +1,45 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: devops-platform-prod
+  namespace: argocd
+  labels:
+    environment: production
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: devops-deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: devops-alerts
+    notifications.argoproj.io/subscribe.on-health-degraded.pagerduty: devops-oncall
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: devops-platform
+
+  source:
+    repoURL: https://github.com/example/aws-devops-platform.git
+    targetRevision: main
+    path: kubernetes/overlays/prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: devops-platform-prod
+
+  # Manual sync required for production - no auto-prune
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m0s
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas

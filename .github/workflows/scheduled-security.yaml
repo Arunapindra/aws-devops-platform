@@ -1,0 +1,233 @@
+###############################################################################
+# Scheduled Security Scans
+# Runs nightly at 2 AM UTC
+# Scans all ECR images and entire codebase
+# Creates GitHub Issues for new vulnerabilities found
+###############################################################################
+name: Scheduled Security Scans
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  security-events: write
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: aws-devops-platform/app
+
+jobs:
+  ###########################################################################
+  # Job 1: Scan container images in ECR
+  ###########################################################################
+  scan-ecr-images:
+    name: Scan ECR Container Images
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.1
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-security-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.0.1
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Get latest image tags from ECR
+        id: tags
+        run: |
+          TAGS=$(aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --query 'sort_by(imageDetails,& imagePushedAt)[-5:].imageTags[0]' \
+            --output text 2>/dev/null || echo "")
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "Scanning tags: ${TAGS}"
+
+      - name: Scan each image with Trivy
+        run: |
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          REPORT_FILE="/tmp/ecr-scan-report.txt"
+          echo "# ECR Image Scan Report - $(date -u +%Y-%m-%d)" > "$REPORT_FILE"
+          echo "" >> "$REPORT_FILE"
+
+          for TAG in ${{ steps.tags.outputs.tags }}; do
+            [ -z "$TAG" ] && continue
+            IMAGE="${REGISTRY}/${{ env.ECR_REPOSITORY }}:${TAG}"
+            echo "Scanning ${IMAGE}..."
+            echo "## Image: ${TAG}" >> "$REPORT_FILE"
+
+            docker pull "${IMAGE}" 2>/dev/null || { echo "Failed to pull ${TAG}" >> "$REPORT_FILE"; continue; }
+
+            trivy image --severity CRITICAL,HIGH --format table "${IMAGE}" >> "$REPORT_FILE" 2>/dev/null || true
+            echo "" >> "$REPORT_FILE"
+          done
+
+      - name: Upload ECR scan results
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: ecr-scan-results
+          path: /tmp/ecr-scan-report.txt
+          retention-days: 90
+
+  ###########################################################################
+  # Job 2: Scan entire codebase and create issues
+  ###########################################################################
+  scan-codebase:
+    name: Scan Codebase
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.18.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-fs-results.json
+          severity: CRITICAL,HIGH
+
+      - name: Run Trivy config scan
+        uses: aquasecurity/trivy-action@0.18.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: json
+          output: trivy-config-results.json
+          severity: CRITICAL,HIGH
+
+      - name: Run Checkov on entire IaC
+        uses: bridgecrewio/checkov-action@v12.2691.0
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: json
+          output_file_path: checkov-results.json
+          soft_fail: true
+
+      - name: Analyze results and create GitHub issues
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            let vulnerabilities = [];
+
+            // Parse Trivy filesystem results
+            try {
+              const trivyFs = JSON.parse(fs.readFileSync('trivy-fs-results.json', 'utf8'));
+              if (trivyFs.Results) {
+                for (const result of trivyFs.Results) {
+                  if (result.Vulnerabilities) {
+                    for (const vuln of result.Vulnerabilities) {
+                      vulnerabilities.push({
+                        source: 'Trivy (filesystem)',
+                        id: vuln.VulnerabilityID,
+                        severity: vuln.Severity,
+                        title: vuln.Title || vuln.VulnerabilityID,
+                        target: result.Target
+                      });
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('No Trivy FS results to parse:', e.message);
+            }
+
+            // Parse Trivy config results
+            try {
+              const trivyConfig = JSON.parse(fs.readFileSync('trivy-config-results.json', 'utf8'));
+              if (trivyConfig.Results) {
+                for (const result of trivyConfig.Results) {
+                  if (result.Misconfigurations) {
+                    for (const m of result.Misconfigurations) {
+                      vulnerabilities.push({
+                        source: 'Trivy (config)',
+                        id: m.ID,
+                        severity: m.Severity,
+                        title: m.Title,
+                        target: result.Target
+                      });
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('No Trivy config results to parse:', e.message);
+            }
+
+            if (vulnerabilities.length === 0) {
+              console.log('No vulnerabilities found - no issue created');
+              return;
+            }
+
+            // Group by severity
+            const critical = vulnerabilities.filter(v => v.severity === 'CRITICAL');
+            const high = vulnerabilities.filter(v => v.severity === 'HIGH');
+            const today = new Date().toISOString().split('T')[0];
+
+            const title = `Security Scan: ${today} - ${critical.length} Critical, ${high.length} High`;
+
+            let body = `## Nightly Security Scan Report\n\n`;
+            body += `**Date:** ${today}\n`;
+            body += `**Total Issues:** ${vulnerabilities.length}\n\n`;
+
+            if (critical.length > 0) {
+              body += `### Critical Vulnerabilities\n\n`;
+              for (const v of critical) {
+                body += `- **${v.id}**: ${v.title} (${v.source} - ${v.target})\n`;
+              }
+              body += `\n`;
+            }
+
+            if (high.length > 0) {
+              body += `### High Vulnerabilities\n\n`;
+              for (const v of high.slice(0, 25)) {
+                body += `- **${v.id}**: ${v.title} (${v.source} - ${v.target})\n`;
+              }
+              if (high.length > 25) {
+                body += `- ... and ${high.length - 25} more\n`;
+              }
+            }
+
+            body += `\n---\n*This issue was created automatically by the nightly security scan.*`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['security', 'automated-scan']
+            });
+
+            console.log(`Created issue: ${title}`);
+
+      - name: Upload all scan results
+        if: always()
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: codebase-scan-results
+          path: |
+            trivy-fs-results.json
+            trivy-config-results.json
+          retention-days: 90

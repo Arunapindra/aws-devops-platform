@@ -1,0 +1,48 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: devops-platform
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: DevOps Platform - all application deployments
+
+  sourceRepos:
+    - "https://github.com/*/aws-devops-platform.git"
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: devops-platform-dev
+    - server: https://kubernetes.default.svc
+      namespace: devops-platform-staging
+    - server: https://kubernetes.default.svc
+      namespace: devops-platform-prod
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+
+  roles:
+    - name: developer
+      description: Developer role - read access, sync dev only
+      policies:
+        - p, proj:devops-platform:developer, applications, get, devops-platform/*, allow
+        - p, proj:devops-platform:developer, applications, sync, devops-platform/*-dev, allow
+        - p, proj:devops-platform:developer, logs, get, devops-platform/*, allow
+      groups:
+        - devops-platform-developers
+
+    - name: admin
+      description: Admin role - full access to all environments
+      policies:
+        - p, proj:devops-platform:admin, applications, *, devops-platform/*, allow
+        - p, proj:devops-platform:admin, clusters, get, devops-platform/*, allow
+        - p, proj:devops-platform:admin, repositories, *, devops-platform/*, allow
+        - p, proj:devops-platform:admin, logs, get, devops-platform/*, allow
+      groups:
+        - devops-platform-admins

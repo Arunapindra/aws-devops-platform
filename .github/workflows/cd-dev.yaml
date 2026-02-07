@@ -1,0 +1,216 @@
+###############################################################################
+# CD Pipeline - Deploy to Dev
+# Triggers on push to develop branch
+# Builds image, pushes to ECR, updates GitOps repo, runs smoke tests
+###############################################################################
+name: CD - Deploy to Dev
+
+on:
+  push:
+    branches: [develop]
+
+permissions:
+  id-token: write
+  contents: write
+  packages: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: aws-devops-platform/app
+  GITOPS_REPO: aws-devops-platform-gitops
+  APP_NAME: aws-devops-platform
+  DEV_NAMESPACE: dev
+
+concurrency:
+  group: cd-dev
+  cancel-in-progress: false
+
+jobs:
+  ###########################################################################
+  # Job 1: Build and push Docker image to ECR
+  ###########################################################################
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-22.04
+    environment: dev
+    outputs:
+      image_tag: ${{ github.sha }}
+      full_image: ${{ steps.image.outputs.full_image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.1.0
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-cd-dev-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.0.1
+
+      - name: Set full image reference
+        id: image
+        run: |
+          FULL_IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Image: ${FULL_IMAGE}"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:develop-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=develop
+
+  ###########################################################################
+  # Job 2: Update GitOps repo so ArgoCD syncs automatically
+  ###########################################################################
+  update-gitops:
+    name: Update GitOps Repository
+    runs-on: ubuntu-22.04
+    needs: build-and-push
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4.1.1
+        with:
+          repository: ${{ github.repository_owner }}/${{ env.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2.1.0
+
+      - name: Update Kustomize image tag for dev
+        run: |
+          cd gitops/kubernetes/overlays/dev
+          kustomize edit set image ${{ env.ECR_REPOSITORY }}=${{ needs.build-and-push.outputs.full_image }}
+          echo "Updated kustomization.yaml:"
+          cat kustomization.yaml
+
+      - name: Commit and push changes
+        run: |
+          cd gitops
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore(dev): update image to ${{ github.sha }}"
+          git push
+
+  ###########################################################################
+  # Job 3: Smoke tests after deploy
+  ###########################################################################
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-22.04
+    needs: update-gitops
+    environment: dev
+    steps:
+      - name: Wait for ArgoCD sync
+        run: |
+          echo "Waiting 60s for ArgoCD to detect and sync changes..."
+          sleep 60
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.APP_NAME }}-dev \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for deployment rollout
+        run: |
+          echo "Waiting for deployment rollout..."
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            -n ${{ env.DEV_NAMESPACE }} \
+            --timeout=300s
+
+      - name: Run health check smoke test
+        run: |
+          echo "Getting service endpoint..."
+          ENDPOINT=$(kubectl get svc ${{ env.APP_NAME }} \
+            -n ${{ env.DEV_NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          echo "Running health check against ${ENDPOINT}..."
+          for i in $(seq 1 10); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://${ENDPOINT}/health" || true)
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed on attempt ${i}"
+              exit 0
+            fi
+            echo "Attempt ${i}: HTTP ${HTTP_CODE}, retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after 10 attempts"
+          exit 1
+
+  ###########################################################################
+  # Job 4: Slack notifications
+  ###########################################################################
+  notify:
+    name: Notify
+    runs-on: ubuntu-22.04
+    needs: [build-and-push, update-gitops, smoke-tests]
+    if: always()
+    steps:
+      - name: Slack notification on success
+        if: needs.smoke-tests.result == 'success'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "Dev deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Dev Deployment Successful* :white_check_mark:\n*Commit:* `${{ github.sha }}`\n*Author:* ${{ github.actor }}\n*Repo:* ${{ github.repository }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Slack notification on failure
+        if: needs.smoke-tests.result == 'failure' || needs.build-and-push.result == 'failure'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "Dev deployment FAILED",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Dev Deployment FAILED* :x:\n*Commit:* `${{ github.sha }}`\n*Author:* ${{ github.actor }}\n*Run:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

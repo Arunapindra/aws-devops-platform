@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devops-platform-app-config
+data:
+  APP_ENV: "production"
+  APP_PORT: "8080"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  METRICS_ENABLED: "true"
+  METRICS_PATH: "/metrics"
+  HEALTH_CHECK_PATH: "/healthz"
+  READINESS_CHECK_PATH: "/readyz"

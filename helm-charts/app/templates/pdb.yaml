@@ -1,0 +1,13 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "devops-platform-app.fullname" . }}
+  labels:
+    {{- include "devops-platform-app.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "devops-platform-app.selectorLabels" . | nindent 6 }}
+{{- end }}

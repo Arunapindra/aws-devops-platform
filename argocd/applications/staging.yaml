@@ -1,0 +1,36 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: devops-platform-staging
+  namespace: argocd
+  labels:
+    environment: staging
+  annotations:
+    notifications.argoproj.io/subscribe.on-sync-succeeded.slack: devops-deployments
+    notifications.argoproj.io/subscribe.on-sync-failed.slack: devops-alerts
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: devops-platform
+
+  source:
+    repoURL: https://github.com/example/aws-devops-platform.git
+    targetRevision: main
+    path: kubernetes/overlays/staging
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: devops-platform-staging
+
+  # Manual sync required for staging
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m0s
